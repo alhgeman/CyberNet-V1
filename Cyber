@@ -1,9 +1,10 @@
+-- Services
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
--- Check if the executor supports the 2D Drawing API (for Tracers)
+-- 2D Drawing API Support Check
 local DrawingSupported = false
 pcall(function()
     local tempLine = Drawing.new("Line")
@@ -11,86 +12,113 @@ pcall(function()
     DrawingSupported = true
 end)
 
--- === GLOBALS ===
-_G.HitboxEnabled = false
-_G.HeadSize = 15
-_G.HitboxTransparency = 0.75
-_G.EspEnabled = false
-_G.TeamCheck = false
-_G.TracersEnabled = false
+-- Configuration & State Management
+local Config = {
+    HitboxEnabled = false,
+    HeadSize = 15,
+    HitboxTransparency = 0.75,
+    
+    GlobalHitboxEnabled = false,
+    GlobalHitboxSize = 10,
+    GlobalHitboxTransparency = 0.7,
+    
+    EspEnabled = false,
+    TracersEnabled = false,
+    FreezePlayers = false,
+    TeamCheck = false,
+    
+    UpdateInterval = 0.05 -- Seconds between non-render logic sweeps (FPS Booster)
+}
 
--- Globale Hitbox + Freeze
-_G.GlobalHitboxEnabled = false
-_G.GlobalHitboxSize = 10
-_G.GlobalHitboxTransparency = 0.7
-_G.FreezePlayers = false
+-- Memory Tracking Containers
+local Tracers = {}
+local Connections = {}
+local RaycastParameters = RaycastParams.new()
+RaycastParameters.FilterType = Enum.RaycastFilterType.Exclude
 
--- === CORE SYSTEM FUNCTIONS ===
+-- Core Helper Functions
 local function isAlive(player)
-    if player and player.Character and player.Character:FindFirstChildOfClass("Humanoid") then
-        return player.Character:FindFirstChildOfClass("Humanoid").Health > 0
-    end
-    return false
+    if not player or not player.Character then return false end
+    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+    return humanoid and humanoid.Health > 0
 end
 
 local function isTarget(player)
     if not player or player == Players.LocalPlayer then return false end
     if not isAlive(player) then return false end
     
-    if _G.TeamCheck then
-        if player.Team == Players.LocalPlayer.Team then
-            return false
-        end
+    if Config.TeamCheck and player.Team == Players.LocalPlayer.Team then
+        return false
     end
     return true
 end
 
--- === SICHTBARKEITSPRÜFUNG (für ESP-Farbwechsel) ===
+-- Optimized Raycasting Visibility Check
 local function isVisible(player)
     local character = player.Character
     if not character then return false end
-    local head = character:FindFirstChild("Head")
-    if not head then return false end
     
+    local head = character:FindFirstChild("Head")
     local camera = Workspace.CurrentCamera
-    if not camera then return false end
+    if not head or not camera then return false end
     
     local origin = camera.CFrame.Position
     local targetPos = head.Position
-    local direction = (targetPos - origin).Unit
-    local distance = (targetPos - origin).Magnitude
+    local direction = targetPos - origin
     
-    -- Raycast mit Ignorieren des eigenen Charakters
-    local ignoreList = {Players.LocalPlayer.Character}
-    local rayParams = RaycastParams.new()
-    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
-    rayParams.FilterDescendantsInstances = ignoreList
+    local localChar = Players.LocalPlayer.Character
+    RaycastParameters.FilterDescendantsInstances = localChar and {localChar} or {}
     
-    local result = Workspace:Raycast(origin, direction * distance, rayParams)
+    local result = Workspace:Raycast(origin, direction, RaycastParameters)
     if result then
-        local hit = result.Instance
-        -- Wenn der getroffene Teil zum Ziel-Charakter gehört, ist er sichtbar
-        if hit and hit:IsDescendantOf(character) then
-            return true
-        else
-            return false
-        end
-    else
-        -- Kein Treffer = direkte Sichtlinie
-        return true
+        return result.Instance:IsDescendantOf(character)
     end
+    return true
 end
 
+-- Reset Functions with Safe Error Handling
 local function resetHitbox(player)
     pcall(function()
-        if player and player.Character and player.Character:FindFirstChild("Head") then
-            local head = player.Character.Head
-            if head.Size ~= Vector3.new(2, 1, 1) then
-                head.Size = Vector3.new(2, 1, 1)
-                head.Transparency = 0
-                head.BrickColor = BrickColor.new("Medium stone grey")
-                head.Material = Enum.Material.Plastic
+        if player and player.Character then
+            local head = player.Character:FindFirstChild("Head")
+            if head and head:GetAttribute("OriginalSize") then
+                head.Size = head:GetAttribute("OriginalSize")
+                head.Transparency = head:GetAttribute("OriginalTransparency") or 0
+                head.BrickColor = head:GetAttribute("OriginalColor") or BrickColor.new("Medium stone grey")
+                head.Material = head:GetAttribute("OriginalMaterial") or Enum.Material.Plastic
                 head.CanCollide = true
+                head:SetAttribute("OriginalSize", nil)
+            end
+        end
+    end)
+end
+
+local function resetGlobalHitbox(player)
+    pcall(function()
+        local character = player and player.Character
+        if character then
+            for _, part in ipairs(character:GetChildren()) do
+                if part:IsA("BasePart") and part:GetAttribute("GlobalOrigSize") then
+                    part.Size = part:GetAttribute("GlobalOrigSize")
+                    part.Transparency = part:GetAttribute("GlobalOrigTransp") or 0
+                    part.BrickColor = part:GetAttribute("GlobalOrigColor") or BrickColor.new("Medium stone grey")
+                    part.Material = part:GetAttribute("GlobalOrigMaterial") or Enum.Material.Plastic
+                    part:SetAttribute("GlobalOrigSize", nil)
+                end
+            end
+        end
+    end)
+end
+
+local function freezePlayer(player, freeze)
+    pcall(function()
+        local character = player and player.Character
+        if character then
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if humanoid then
+                humanoid.WalkSpeed = freeze and 0 or 16
+                humanoid.JumpPower = freeze and 0 or 50
+                humanoid.AutoJumpEnabled = not freeze
             end
         end
     end)
@@ -104,8 +132,59 @@ local function removeESP(player)
             
             local head = player.Character:FindFirstChild("Head")
             if head then
-                local bGui = head:FindFirstChild("ESP_Billboard")
-                if bGui then bGui:Destroy() end
+                local billboard = head:FindFirstChild("ESP_Billboard")
+                if billboard then billboard:Destroy() end
+            end
+        end
+    end)
+end
+
+local function removeTracer(player)
+    if Tracers[player] then
+        pcall(function() Tracers[player]:Destroy() end)
+        Tracers[player] = nil
+    end
+end
+
+-- Feature Implementation Functions
+local function applyHitbox(player)
+    pcall(function()
+        local head = player.Character and player.Character:FindFirstChild("Head")
+        if head then
+            if not head:GetAttribute("OriginalSize") then
+                head:SetAttribute("OriginalSize", head.Size)
+                head:SetAttribute("OriginalTransparency", head.Transparency)
+                head:SetAttribute("OriginalColor", head.BrickColor)
+                head:SetAttribute("OriginalMaterial", head.Material)
+            end
+            head.Size = Vector3.new(Config.HeadSize, Config.HeadSize, Config.HeadSize)
+            head.Transparency = Config.HitboxTransparency
+            head.BrickColor = BrickColor.new("Really red")
+            head.Material = Enum.Material.Neon
+            head.CanCollide = false
+            head.Massless = true
+        end
+    end)
+end
+
+local function applyGlobalHitbox(player)
+    pcall(function()
+        local character = player.Character
+        if character then
+            for _, part in ipairs(character:GetChildren()) do
+                if part:IsA("BasePart") then
+                    if not part:GetAttribute("GlobalOrigSize") then
+                        part:SetAttribute("GlobalOrigSize", part.Size)
+                        part:SetAttribute("GlobalOrigTransp", part.Transparency)
+                        part:SetAttribute("GlobalOrigColor", part.BrickColor)
+                        part:SetAttribute("GlobalOrigMaterial", part.Material)
+                    end
+                    part.Size = Vector3.new(Config.GlobalHitboxSize, Config.GlobalHitboxSize, Config.GlobalHitboxSize)
+                    part.Transparency = Config.GlobalHitboxTransparency
+                    part.BrickColor = BrickColor.new("Bright red")
+                    part.Material = Enum.Material.Neon
+                    part.CanCollide = true
+                end
             end
         end
     end)
@@ -116,7 +195,6 @@ local function applyESP(player)
         local character = player.Character
         if not character then return end
         
-        -- 1. Outline Highlight
         local highlight = character:FindFirstChild("ESPHighlight")
         if not highlight then
             highlight = Instance.new("Highlight")
@@ -126,233 +204,128 @@ local function applyESP(player)
             highlight.Parent = character
         end
         
-        -- Farbwechsel basierend auf Sichtbarkeit
         local visible = isVisible(player)
-        if visible then
-            highlight.FillColor = Color3.fromRGB(255, 0, 0)      -- Rot
-            highlight.OutlineColor = Color3.fromRGB(255, 0, 0)  -- Rot
-        else
-            highlight.FillColor = Color3.fromRGB(0, 255, 136)   -- Grün (normal)
-            highlight.OutlineColor = Color3.fromRGB(0, 255, 136)
-        end
+        local color = visible and Color3.fromRGB(255, 0, 0) or Color3.fromRGB(0, 255, 136)
+        highlight.FillColor = color
+        highlight.OutlineColor = color
         
-        -- 2. Minimalist Health Bar
         local head = character:FindFirstChild("Head")
         if head then
-            local bGui = head:FindFirstChild("ESP_Billboard")
-            if not bGui then
-                bGui = Instance.new("BillboardGui")
-                bGui.Name = "ESP_Billboard"
-                bGui.Size = UDim2.new(0, 50, 0, 5)
-                bGui.StudsOffset = Vector3.new(0, 1.8, 0)
-                bGui.AlwaysOnTop = true
+            local billboard = head:FindFirstChild("ESP_Billboard")
+            if not billboard then
+                billboard = Instance.new("BillboardGui")
+                billboard.Name = "ESP_Billboard"
+                billboard.Size = UDim2.new(0, 50, 0, 5)
+                billboard.StudsOffset = Vector3.new(0, 1.8, 0)
+                billboard.AlwaysOnTop = true
                 
-                local hBarBg = Instance.new("Frame")
-                hBarBg.Name = "HealthBarBg"
-                hBarBg.Size = UDim2.new(1, 0, 1, 0)
-                hBarBg.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
-                hBarBg.BorderSizePixel = 0
-                hBarBg.Parent = bGui
+                local background = Instance.new("Frame")
+                background.Name = "HealthBarBg"
+                background.Size = UDim2.new(1, 0, 1, 0)
+                background.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+                background.BorderSizePixel = 0
+                background.Parent = billboard
                 
-                local hBarFill = Instance.new("Frame")
-                hBarFill.Name = "Fill"
-                hBarFill.Size = UDim2.new(1, 0, 1, 0)
-                hBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 136)
-                hBarFill.BorderSizePixel = 0
-                hBarFill.Parent = hBarBg
+                local fill = Instance.new("Frame")
+                fill.Name = "Fill"
+                fill.Size = UDim2.new(1, 0, 1, 0)
+                fill.BackgroundColor3 = Color3.fromRGB(0, 255, 136)
+                fill.BorderSizePixel = 0
+                fill.Parent = background
                 
-                local cr1 = Instance.new("UICorner")
-                cr1.CornerRadius = UDim.new(1, 0)
-                cr1.Parent = hBarBg
+                local corner1 = Instance.new("UICorner")
+                corner1.CornerRadius = UDim.new(1, 0)
+                corner1.Parent = background
                 
-                local cr2 = Instance.new("UICorner")
-                cr2.CornerRadius = UDim.new(1, 0)
-                cr2.Parent = hBarFill
+                local corner2 = Instance.new("UICorner")
+                corner2.CornerRadius = UDim.new(1, 0)
+                corner2.Parent = fill
                 
-                bGui.Parent = head
+                billboard.Parent = head
             end
             
-            local hBarBg = bGui:FindFirstChild("HealthBarBg")
-            if hBarBg then
-                local hBarFill = hBarBg:FindFirstChild("Fill")
-                local humanoid = character:FindFirstChildOfClass("Humanoid")
-                if hBarFill and humanoid then
-                    local percent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
-                    hBarFill.Size = UDim2.new(percent, 0, 1, 0)
-                    hBarFill.BackgroundColor3 = Color3.fromRGB(255 * (1 - percent), 255 * percent, 136 * percent)
-                end
+            local fill = billboard:FindFirstChild("HealthBarBg") and billboard.HealthBarBg:FindFirstChild("Fill")
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if fill and humanoid then
+                local percent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+                fill.Size = UDim2.new(percent, 0, 1, 0)
+                fill.BackgroundColor3 = Color3.fromRGB(255 * (1 - percent), 255 * percent, 136 * percent)
             end
         end
     end)
 end
 
--- === 2D TRACERS ===
-local tracers = {}
-
-local function removeTracer(player)
-    if tracers[player] then
-        pcall(function() tracers[player]:Destroy() end)
-        tracers[player] = nil
-    end
-end
-
 local function applyTracer(player)
     if not DrawingSupported then return end
-    local character = player.Character
-    if not character then return end
-    
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-    
-    local camera = Workspace.CurrentCamera
-    local screenPos, onScreen = camera:WorldToViewportPoint(hrp.Position)
-    
-    if onScreen then
-        if not tracers[player] then
-            pcall(function()
-                local line = Drawing.new("Line")
-                line.Thickness = 1.0
-                line.Color = Color3.fromRGB(0, 255, 136)
-                line.Transparency = 0.5
-                tracers[player] = line
-            end)
-        end
+    pcall(function()
+        local character = player.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        local camera = Workspace.CurrentCamera
         
-        local line = tracers[player]
-        if line then
-            pcall(function()
+        if hrp and camera then
+            local screenPos, onScreen = camera:WorldToViewportPoint(hrp.Position)
+            if onScreen then
+                if not Tracers[player] then
+                    local line = Drawing.new("Line")
+                    line.Thickness = 1.0
+                    line.Color = Color3.fromRGB(0, 255, 136)
+                    line.Transparency = 0.5
+                    Tracers[player] = line
+                end
+                
+                local line = Tracers[player]
                 line.From = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
                 line.To = Vector2.new(screenPos.X, screenPos.Y)
                 line.Visible = true
-            end)
-        end
-    else
-        removeTracer(player)
-    end
-end
-
--- === GLOBALE HITBOX & FREEZE ===
-local function applyGlobalHitbox(player)
-    local character = player.Character
-    if not character then return end
-    
-    for _, part in ipairs(character:GetChildren()) do
-        if part:IsA("BasePart") then
-            if not part:GetAttribute("GlobalOrigSize") then
-                part:SetAttribute("GlobalOrigSize", part.Size)
-                part:SetAttribute("GlobalOrigTransp", part.Transparency)
-                part:SetAttribute("GlobalOrigColor", part.BrickColor)
-                part:SetAttribute("GlobalOrigMaterial", part.Material)
+            else
+                removeTracer(player)
             end
-            part.Size = Vector3.new(_G.GlobalHitboxSize, _G.GlobalHitboxSize, _G.GlobalHitboxSize)
-            part.Transparency = _G.GlobalHitboxTransparency
-            part.BrickColor = BrickColor.new("Bright red")
-            part.Material = Enum.Material.Neon
-            part.CanCollide = true
+        else
+            removeTracer(player)
         end
-    end
+    end)
 end
 
-local function resetGlobalHitbox(player)
-    local character = player.Character
-    if not character then return end
-    
-    for _, part in ipairs(character:GetChildren()) do
-        if part:IsA("BasePart") and part:GetAttribute("GlobalOrigSize") then
-            part.Size = part:GetAttribute("GlobalOrigSize")
-            part.Transparency = part:GetAttribute("GlobalOrigTransp")
-            part.BrickColor = part:GetAttribute("GlobalOrigColor") or BrickColor.new("Medium stone grey")
-            part.Material = part:GetAttribute("GlobalOrigMaterial") or Enum.Material.Plastic
-            part:SetAttribute("GlobalOrigSize", nil)
-            part:SetAttribute("GlobalOrigTransp", nil)
-            part:SetAttribute("GlobalOrigColor", nil)
-            part:SetAttribute("GlobalOrigMaterial", nil)
-        end
-    end
-end
-
-local function freezePlayer(player, freeze)
-    local character = player.Character
-    if not character then return end
-    
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        humanoid.WalkSpeed = freeze and 0 or 16
-        humanoid.JumpPower = freeze and 0 or 50
-        humanoid.AutoJumpEnabled = not freeze
-    end
-end
-
--- === SPIELER-VERLASSEN-BEREINIGUNG ===
-Players.PlayerRemoving:Connect(function(player)
+-- Cleanup Handler
+local function cleanupPlayer(player)
     removeTracer(player)
     removeESP(player)
     resetHitbox(player)
     resetGlobalHitbox(player)
     freezePlayer(player, false)
+end
+
+Players.PlayerRemoving:Connect(cleanupPlayer)
+
+-- Optimized Execution Loops
+task.spawn(function()
+    while task.wait(Config.UpdateInterval) do
+        for _, player in ipairs(Players:GetPlayers()) do
+            if isTarget(player) then
+                if Config.HitboxEnabled then applyHitbox(player) else resetHitbox(player) end
+                if Config.GlobalHitboxEnabled then applyGlobalHitbox(player) else resetGlobalHitbox(player) end
+                freezePlayer(player, Config.FreezePlayers)
+                if Config.EspEnabled then applyESP(player) else removeESP(player) end
+            else
+                cleanupPlayer(player)
+            end
+        end
+    end
 end)
 
--- === BACKGROUND RUNTIME ===
 RunService.RenderStepped:Connect(function()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= Players.LocalPlayer then
-            if isTarget(player) and player.Character then
-                -- Kopf-Hitbox
-                if player.Character:FindFirstChild("Head") then
-                    local head = player.Character.Head
-                    if _G.HitboxEnabled then
-                        pcall(function()
-                            head.Size = Vector3.new(_G.HeadSize, _G.HeadSize, _G.HeadSize)
-                            head.Transparency = _G.HitboxTransparency
-                            head.BrickColor = BrickColor.new("Really red")
-                            head.Material = Enum.Material.Neon
-                            head.CanCollide = false
-                            head.Massless = true
-                        end)
-                    else
-                        resetHitbox(player)
-                    end
-                end
-                
-                -- Globale Hitbox
-                if _G.GlobalHitboxEnabled then
-                    applyGlobalHitbox(player)
-                else
-                    resetGlobalHitbox(player)
-                end
-                
-                -- Freeze
-                if _G.FreezePlayers then
-                    freezePlayer(player, true)
-                else
-                    freezePlayer(player, false)
-                end
-                
-                -- ESP (mit Sichtbarkeits-Farbwechsel)
-                if _G.EspEnabled then
-                    applyESP(player)
-                else
-                    removeESP(player)
-                end
-                
-                -- Tracers
-                if _G.TracersEnabled then
-                    applyTracer(player)
-                else
-                    removeTracer(player)
-                end
+    if Config.TracersEnabled then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if isTarget(player) then
+                applyTracer(player)
             else
-                resetHitbox(player)
-                resetGlobalHitbox(player)
-                freezePlayer(player, false)
-                removeESP(player)
                 removeTracer(player)
             end
         end
     end
 end)
 
--- === UI BUILDER (unverändert, aber Höhe angepasst) ===
+-- User Interface Setup
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "CyberNet_V1_Engine"
 ScreenGui.ResetOnSpawn = false
@@ -362,7 +335,6 @@ pcall(function() parentGui = game:GetService("CoreGui") end)
 if not parentGui then parentGui = Players.LocalPlayer:WaitForChild("PlayerGui") end
 ScreenGui.Parent = parentGui
 
--- Main Panel
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.new(0, 310, 0, 460)
@@ -380,7 +352,6 @@ MainStroke.Color = Color3.fromRGB(30, 30, 38)
 MainStroke.Thickness = 1.2
 MainStroke.Parent = MainFrame
 
--- Header
 local Header = Instance.new("Frame")
 Header.Name = "Header"
 Header.Size = UDim2.new(1, 0, 0, 45)
@@ -422,7 +393,6 @@ StatusText.TextSize = 11
 StatusText.TextXAlignment = Enum.TextXAlignment.Left
 StatusText.Parent = Header
 
--- Content Container
 local Scroll = Instance.new("ScrollingFrame")
 Scroll.Size = UDim2.new(1, -16, 1, -60)
 Scroll.Position = UDim2.new(0, 8, 0, 52)
@@ -437,7 +407,7 @@ ListLayout.Padding = UDim.new(0, 6)
 ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 ListLayout.Parent = Scroll
 
--- === UI ELEMENT GENERATORS ===
+-- UI Generators
 local function AddToggle(name, desc, default, callback)
     local Frame = Instance.new("Frame")
     Frame.Size = UDim2.new(1, -4, 0, 42)
@@ -494,7 +464,11 @@ local function AddToggle(name, desc, default, callback)
     SwCorner.Parent = Switch
 
     local state = default
+    local lastClick = 0
     Button.MouseButton1Click:Connect(function()
+        if os.clock() - lastClick < 0.1 then return end -- Debounce check
+        lastClick = os.clock()
+        
         state = not state
         Button.BackgroundColor3 = state and Color3.fromRGB(0, 255, 136) or Color3.fromRGB(30, 30, 35)
         Switch.Position = state and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
@@ -586,47 +560,47 @@ local function AddSlider(name, min, max, default, callback)
     end)
 end
 
--- === UI ELEMENTE ===
-AddToggle("Hitbox Expander", "Increase enemy hitboxes (Head only)", _G.HitboxEnabled, function(state)
-    _G.HitboxEnabled = state
+-- UI Controls Registration
+AddToggle("Hitbox Expander", "Increase enemy hitboxes (Head only)", Config.HitboxEnabled, function(state)
+    Config.HitboxEnabled = state
 end)
-AddSlider("Hitbox Size", 2, 50, _G.HeadSize, function(value)
-    _G.HeadSize = value
+AddSlider("Hitbox Size", 2, 50, Config.HeadSize, function(value)
+    Config.HeadSize = value
 end)
-AddSlider("Hitbox Transparency (%)", 0, 95, 75, function(value)
-    _G.HitboxTransparency = value / 100
-end)
-
-AddToggle("Global Hitbox", "Enlarge ALL body parts (whole character)", _G.GlobalHitboxEnabled, function(state)
-    _G.GlobalHitboxEnabled = state
-end)
-AddSlider("Global Hitbox Size", 1, 30, _G.GlobalHitboxSize, function(value)
-    _G.GlobalHitboxSize = value
-end)
-AddSlider("Global Hitbox Transparency (%)", 0, 95, 70, function(value)
-    _G.GlobalHitboxTransparency = value / 100
+AddSlider("Hitbox Transparency (%)", 0, 95, math.round(Config.HitboxTransparency * 100), function(value)
+    Config.HitboxTransparency = value / 100
 end)
 
-AddToggle("Visual ESP", "Sleek highlights – turns RED when visible", _G.EspEnabled, function(state)
-    _G.EspEnabled = state
+AddToggle("Global Hitbox", "Enlarge ALL body parts (whole character)", Config.GlobalHitboxEnabled, function(state)
+    Config.GlobalHitboxEnabled = state
 end)
-AddToggle("Cyber Tracers", "Draw lines to target root parts", _G.TracersEnabled, function(state)
-    _G.TracersEnabled = state
+AddSlider("Global Hitbox Size", 1, 30, Config.GlobalHitboxSize, function(value)
+    Config.GlobalHitboxSize = value
+end)
+AddSlider("Global Hitbox Transparency (%)", 0, 95, math.round(Config.GlobalHitboxTransparency * 100), function(value)
+    Config.GlobalHitboxTransparency = value / 100
+end)
+
+AddToggle("Visual ESP", "Sleek highlights – turns RED when visible", Config.EspEnabled, function(state)
+    Config.EspEnabled = state
+end)
+AddToggle("Cyber Tracers", "Draw lines to target root parts", Config.TracersEnabled, function(state)
+    Config.TracersEnabled = state
     if not state then
-        for p, _ in pairs(tracers) do removeTracer(p) end
+        for p, _ in pairs(Tracers) do removeTracer(p) end
     end
 end)
-AddToggle("Freeze Players", "Prevent targets from moving or jumping", _G.FreezePlayers, function(state)
-    _G.FreezePlayers = state
+AddToggle("Freeze Players", "Prevent targets from moving or jumping", Config.FreezePlayers, function(state)
+    Config.FreezePlayers = state
 end)
-AddToggle("Team Check", "Filter out players in your team", _G.TeamCheck, function(state)
-    _G.TeamCheck = state
+AddToggle("Team Check", "Filter out players in your team", Config.TeamCheck, function(state)
+    Config.TeamCheck = state
 end)
 
 local ControlInfo = Instance.new("TextLabel")
 ControlInfo.Size = UDim2.new(1, -4, 0, 30)
 ControlInfo.BackgroundTransparency = 1
-ControlInfo.Text = "Press [RightShift] to Toggle UI"
+ControlInfo.Text = "Press [RightShift] or Tap Button to Toggle UI"
 ControlInfo.TextColor3 = Color3.fromRGB(100, 100, 110)
 ControlInfo.Font = Enum.Font.SourceSansItalic
 ControlInfo.TextSize = 12
@@ -637,7 +611,7 @@ ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
     Scroll.CanvasSize = UDim2.new(0, 0, 0, ListLayout.AbsoluteContentSize.Y + 20)
 end)
 
--- === DRAG & TOGGLE (unverändert) ===
+-- Window Dragging and Mobile Toggle
 local mainDragging, dragStart, startPos
 local mobDragging, mobDragStart, mobStartPos
 
@@ -671,7 +645,7 @@ MobCorner.CornerRadius = UDim.new(0, 4)
 MobCorner.Parent = MobileButton
 
 local MobStroke = Instance.new("UIStroke")
-MobStroke.Color = Color3.fromRGB(0, 255, 136)
+MobStroke.Color = Color3.fromRGB(0, 0, 0)
 MobStroke.Thickness = 1
 MobStroke.Parent = MobileButton
 
